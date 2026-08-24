@@ -1,3 +1,6 @@
 *.d
 *.o
 *.so
+/slop
+/core
+/slop-results.json

@@ -1,0 +1,26 @@
+name: absolute-unsigma-slop
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-smoke:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - name: Build the absolute unsigma slop fork
+        run: go build -trimpath -o slop ./cmd/slop
+      - name: Smoke-run one embedded mandatory case (not a unit test)
+        run: ./slop --only mand.1_builtins_echo.001 --failures-only /bin/bash
+      - name: Write structured CI output
+        if: always()
+        run: ./slop --only mand.1_builtins_echo.001 --format json /bin/bash > slop-results.json || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: absolute-unsigma-slop-results
+          path: slop-results.json
