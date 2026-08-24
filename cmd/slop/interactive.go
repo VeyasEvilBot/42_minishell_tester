@@ -1,8 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/creack/pty"
@@ -36,6 +35,7 @@ type ptyResult struct {
 	Statuses   []int
 	ExitCode   int
 	TimedOut   bool
+	StartError string
 	Err        error
 }
 
@@ -155,25 +155,55 @@ func runInteractiveOne(t testCase, o options) result {
 }
 
 func runPTY(timeout time.Duration, name string, args []string, s ptyScenario) ptyResult {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := exec.Command(name, args...)
 	cmd.Env = append(os.Environ(), "PS1=SLOP> ", "PS2=MORE> ", "TERM=xterm", "LC_ALL=C")
 	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Rows: 30, Cols: 120})
 	if err != nil {
-		return ptyResult{ExitCode: 127, Err: err}
+		return ptyResult{ExitCode: 127, StartError: err.Error(), Err: err}
 	}
-	var buf bytes.Buffer
+	deadline := time.Now().Add(timeout)
+	var buf boundedBuffer
 	copyDone := make(chan struct{})
 	go func() { _, _ = io.Copy(&buf, ptmx); close(copyDone) }()
-	time.Sleep(180 * time.Millisecond)
-	for _, action := range s.Actions {
-		if action.Delay > 0 {
-			time.Sleep(action.Delay)
-		}
-		_, _ = ptmx.Write([]byte(action.Data))
+	waitForQuiet(&buf, 80*time.Millisecond, 600*time.Millisecond)
+	_, _ = ptmx.Write([]byte("printf '%s\\n' __SLOP_READY_EXEC__\n"))
+	if !waitForCount(&buf, "__SLOP_READY_EXEC__", 2, deadline) {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = ptmx.Close()
+		_ = cmd.Wait()
+		return ptyResult{Transcript: buf.String(), ExitCode: 124, TimedOut: true, Err: errors.New("PTY readiness marker timed out")}
 	}
-	waitErr := cmd.Wait()
+	for _, action := range s.Actions {
+		_, _ = ptmx.Write([]byte(action.Data))
+		quiet := action.Delay
+		if quiet <= 0 {
+			quiet = 80 * time.Millisecond
+		}
+		waitForQuiet(&buf, quiet, 800*time.Millisecond)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	remaining := time.Until(deadline)
+	if remaining < 0 {
+		remaining = 0
+	}
+	timer := time.NewTimer(remaining)
+	var waitErr error
+	timedOut := false
+	select {
+	case waitErr = <-done:
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	case <-timer.C:
+		timedOut = true
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = ptmx.Close()
+		waitErr = <-done
+	}
 	_ = ptmx.Close()
 	select {
 	case <-copyDone:
@@ -188,7 +218,7 @@ func runPTY(timeout time.Duration, name string, args []string, s ptyScenario) pt
 			code = 127
 		}
 	}
-	if ctx.Err() == context.DeadlineExceeded {
+	if timedOut {
 		code = 124
 	}
 	transcript := ansiRE.ReplaceAllString(strings.ReplaceAll(buf.String(), "\r", ""), "")
@@ -198,7 +228,33 @@ func runPTY(timeout time.Duration, name string, args []string, s ptyScenario) pt
 		n, _ := strconv.Atoi(m[1])
 		statuses = append(statuses, n)
 	}
-	return ptyResult{Transcript: strings.TrimSpace(transcript), Statuses: statuses, ExitCode: code, TimedOut: ctx.Err() == context.DeadlineExceeded, Err: waitErr}
+	return ptyResult{Transcript: strings.TrimSpace(transcript), Statuses: statuses, ExitCode: code, TimedOut: timedOut, Err: waitErr}
+}
+
+func waitForQuiet(buf *boundedBuffer, quiet, limit time.Duration) {
+	deadline := time.Now().Add(limit)
+	lastLen := -1
+	stableSince := time.Now()
+	for time.Now().Before(deadline) {
+		n := buf.Len()
+		if n != lastLen {
+			lastLen = n
+			stableSince = time.Now()
+		} else if time.Since(stableSince) >= quiet {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func waitForCount(buf *boundedBuffer, marker string, count int, deadline time.Time) bool {
+	for time.Now().Before(deadline) {
+		if strings.Count(buf.String(), marker) >= count {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
 }
 
 func judgePTY(s ptyScenario, mini, bash ptyResult) (string, string) {
@@ -217,10 +273,10 @@ func judgePTY(s ptyScenario, mini, bash ptyResult) (string, string) {
 		}
 	}
 	if s.NeedAlive {
-		if !strings.Contains(bash.Transcript, "__SLOP_ALIVE__") {
+		if strings.Count(bash.Transcript, "__SLOP_ALIVE__") < 2 {
 			return "warning", "bash did not reach the alive marker"
 		}
-		if !strings.Contains(mini.Transcript, "__SLOP_ALIVE__") {
+		if strings.Count(mini.Transcript, "__SLOP_ALIVE__") < 2 {
 			return "fail", "minishell did not recover to execute the alive marker"
 		}
 	}
@@ -247,13 +303,21 @@ func runPTYLeak(o options, s ptyScenario) (bool, string) {
 	}
 	defer os.RemoveAll(dir)
 	supp := filepath.Join(dir, "minishell.supp")
-	b, _ := corpus.ReadFile("corpus/minishell.supp")
-	_ = os.WriteFile(supp, b, 0600)
+	b, err := corpus.ReadFile("corpus/minishell.supp")
+	if err != nil {
+		return true, "cannot read valgrind suppressions: " + err.Error()
+	}
+	if err := os.WriteFile(supp, b, 0600); err != nil {
+		return true, "cannot write valgrind suppressions: " + err.Error()
+	}
 	args := []string{
 		"--leak-check=full", "--show-leak-kinds=all", "--errors-for-leak-kinds=definite,indirect,possible",
 		"--error-exitcode=97", "--track-fds=yes", "--trace-children=no", "--suppressions=" + supp, o.target,
 	}
 	out := runPTY(o.timeout*4, "valgrind", args, s)
+	if out.StartError != "" || out.TimedOut {
+		return true, "valgrind PTY check did not complete: " + firstNonEmpty(out.StartError, "timed out") + "\n" + out.Transcript
+	}
 	leaked := valgrindErrorRE.MatchString(out.Transcript) || strings.Contains(out.Transcript, "definitely lost:") && !strings.Contains(out.Transcript, "definitely lost: 0 bytes")
 	return leaked, out.Transcript
 }

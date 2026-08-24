@@ -3,7 +3,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -19,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -33,6 +33,7 @@ type config struct {
 	Ignore        []string              `toml:"ignore"`
 	Warn          []string              `toml:"warn"`
 	StrictVersion bool                  `toml:"strict_version"`
+	AllowTests    bool                  `toml:"allow_tests"`
 	Tests         map[string]configTest `toml:"tests"`
 }
 
@@ -48,10 +49,52 @@ type testCase struct {
 }
 
 type runOutput struct {
-	Stdout   string `json:"stdout"`
-	Stderr   string `json:"stderr"`
-	ExitCode int    `json:"exit_code"`
-	TimedOut bool   `json:"timed_out"`
+	Stdout     string `json:"stdout"`
+	Stderr     string `json:"stderr"`
+	ExitCode   int    `json:"exit_code"`
+	TimedOut   bool   `json:"timed_out"`
+	StartError string `json:"start_error,omitempty"`
+}
+
+const maxCaptureBytes = 1 << 20
+
+type boundedBuffer struct {
+	mu        sync.Mutex
+	buf       bytes.Buffer
+	truncated bool
+}
+
+func (b *boundedBuffer) Write(p []byte) (int, error) {
+	n := len(p)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	remaining := maxCaptureBytes - b.buf.Len()
+	if remaining > 0 {
+		if len(p) > remaining {
+			p = p[:remaining]
+			b.truncated = true
+		}
+		_, _ = b.buf.Write(p)
+	} else {
+		b.truncated = true
+	}
+	return n, nil
+}
+
+func (b *boundedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s := b.buf.String()
+	if b.truncated {
+		s += "\n[SLOP OUTPUT TRUNCATED AT 1 MiB]"
+	}
+	return s
+}
+
+func (b *boundedBuffer) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
 }
 
 type result struct {
@@ -122,6 +165,9 @@ func main() {
 	if o.jobs < 1 {
 		fatalIf(errors.New("jobs must be at least 1"))
 	}
+	if o.timeout <= 0 {
+		fatalIf(errors.New("timeout must be greater than zero"))
+	}
 	if o.format != "text" && o.format != "json" && o.format != "jsonl" {
 		fatalIf(errors.New("format must be text, json, or jsonl"))
 	}
@@ -130,6 +176,7 @@ func main() {
 	fatalIf(err)
 	ignore := append(append([]string{}, cfg.Ignore...), splitCSV(o.ignoreCSV)...)
 	only := splitCSV(o.onlyCSV)
+	fatalIf(validatePatterns(ignore, only, cfg.Warn))
 	tests = filterTests(tests, ignore, only, cfg.Warn)
 	if o.list {
 		for _, t := range tests {
@@ -141,7 +188,7 @@ func main() {
 	fatalIf(err)
 	o.target = abs
 	st, err := os.Stat(o.target)
-	if err != nil || st.IsDir() {
+	if err != nil || st.IsDir() || st.Mode()&0111 == 0 {
 		fatalIf(fmt.Errorf("minishell executable not found: %s", o.target))
 	}
 
@@ -181,6 +228,9 @@ func loadConfig(path string) (config, error) {
 		return c, err
 	}
 	_, err = toml.DecodeFile(path, &c)
+	if err == nil && len(c.Tests) > 0 && !c.AllowTests {
+		return c, errors.New(".sloprc [tests] execute under bash/minishell; set allow_tests = true only for a trusted repository")
+	}
 	return c, err
 }
 
@@ -299,6 +349,21 @@ func matchesAny(id string, patterns []string) bool {
 	return false
 }
 
+func validatePatterns(groups ...[]string) error {
+	for _, patterns := range groups {
+		for _, pattern := range patterns {
+			pattern = strings.TrimSpace(pattern)
+			if pattern == "" {
+				continue
+			}
+			if _, err := filepath.Match(pattern, "test"); err != nil {
+				return fmt.Errorf("invalid test glob %q: %w", pattern, err)
+			}
+		}
+	}
+	return nil
+}
+
 func runAll(tests []testCase, o options) []result {
 	jobs := make(chan testCase)
 	results := make(chan result, len(tests))
@@ -341,12 +406,19 @@ func runOne(t testCase, o options) result {
 		return runInteractiveOne(t, o)
 	}
 	start := time.Now()
-	base, _ := os.MkdirTemp("", "slop-*")
+	base, err := os.MkdirTemp("", "slop-*")
+	if err != nil {
+		return testerErrorResult(t, err)
+	}
 	defer os.RemoveAll(base)
 	miniDir := filepath.Join(base, "mini")
 	bashDir := filepath.Join(base, "bash")
-	_ = os.MkdirAll(filepath.Join(miniDir, "outfiles"), 0755)
-	_ = os.MkdirAll(filepath.Join(bashDir, "outfiles"), 0755)
+	bashAgainDir := filepath.Join(base, "bash-again")
+	for _, dir := range []string{miniDir, bashDir, bashAgainDir} {
+		if err := os.MkdirAll(filepath.Join(dir, "outfiles"), 0755); err != nil {
+			return testerErrorResult(t, err)
+		}
+	}
 	mini := runCommand(o.timeout, miniDir, os.Environ(), t.Input, o.target)
 	bash := runCommand(o.timeout, bashDir, os.Environ(), t.Input, "bash", "--posix")
 
@@ -360,9 +432,9 @@ func runOne(t testCase, o options) result {
 	different := mini.Stdout != bash.Stdout || mini.Stderr != bash.Stderr || mini.ExitCode != bash.ExitCode || mini.TimedOut != bash.TimedOut
 	bashUnstable := false
 	if different {
-		bashAgain := runCommand(o.timeout, bashDir, os.Environ(), t.Input, "bash", "--posix")
-		bashAgain.Stdout = normalize(bashAgain.Stdout, bashDir)
-		bashAgain.Stderr = normalizeStderr(bashAgain.Stderr, bashDir)
+		bashAgain := runCommand(o.timeout, bashAgainDir, os.Environ(), t.Input, "bash", "--posix")
+		bashAgain.Stdout = normalize(bashAgain.Stdout, bashAgainDir)
+		bashAgain.Stderr = normalizeStderr(bashAgain.Stderr, bashAgainDir)
 		bashUnstable = bash.Stdout != bashAgain.Stdout || bash.Stderr != bashAgain.Stderr || bash.ExitCode != bashAgain.ExitCode
 	}
 	if !different {
@@ -410,13 +482,27 @@ func runOne(t testCase, o options) result {
 }
 
 func runCommand(timeout time.Duration, dir string, env []string, input, name string, args ...string) runOutput {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, name, args...)
+	cmd := exec.Command(name, args...)
 	cmd.Dir, cmd.Env, cmd.Stdin = dir, append(env, "LC_ALL=C", "TERM=dumb"), strings.NewReader(input)
-	var stdout, stderr bytes.Buffer
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	var stdout, stderr boundedBuffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		return runOutput{ExitCode: 127, StartError: err.Error()}
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	var err error
+	timedOut := false
+	select {
+	case err = <-done:
+	case <-timer.C:
+		timedOut = true
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		err = <-done
+	}
 	code := 0
 	if err != nil {
 		var ee *exec.ExitError
@@ -426,22 +512,32 @@ func runCommand(timeout time.Duration, dir string, env []string, input, name str
 			code = 127
 		}
 	}
-	if ctx.Err() == context.DeadlineExceeded {
+	if timedOut {
 		code = 124
 	}
-	return runOutput{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: code, TimedOut: ctx.Err() == context.DeadlineExceeded}
+	return runOutput{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: code, TimedOut: timedOut}
 }
 
 func runLeak(o options, base, input string) (bool, string) {
 	supp := filepath.Join(base, "minishell.supp")
-	b, _ := corpus.ReadFile("corpus/minishell.supp")
-	_ = os.WriteFile(supp, b, 0600)
+	b, err := corpus.ReadFile("corpus/minishell.supp")
+	if err != nil {
+		return true, "cannot read valgrind suppressions: " + err.Error()
+	}
+	if err := os.WriteFile(supp, b, 0600); err != nil {
+		return true, "cannot write valgrind suppressions: " + err.Error()
+	}
 	dir := filepath.Join(base, "leak")
-	_ = os.MkdirAll(dir, 0755)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return true, "cannot create valgrind workdir: " + err.Error()
+	}
 	out := runCommand(o.timeout*3, dir, os.Environ(), input, "valgrind",
 		"--quiet", "--leak-check=full", "--show-leak-kinds=all", "--errors-for-leak-kinds=definite,indirect,possible",
 		"--error-exitcode=97", "--track-fds=yes", "--trace-children=no", "--suppressions="+supp, o.target)
 	text := out.Stderr
+	if out.StartError != "" || out.TimedOut {
+		return true, "valgrind check did not complete: " + firstNonEmpty(out.StartError, "timed out") + "\n" + text
+	}
 	return out.ExitCode == 97 || strings.Contains(text, "definitely lost:") && !strings.Contains(text, "definitely lost: 0 bytes"), text
 }
 
@@ -478,11 +574,7 @@ func sameWhenSorted(a, b string) bool {
 }
 
 func versionSensitive(input string, bash runOutput) bool {
-	if bash.ExitCode == 2 && containsBuiltin(input) {
-		return true
-	}
-	lower := strings.ToLower(input)
-	return strings.Contains(lower, "env") || strings.Contains(lower, "export") || strings.Contains(lower, "path") || strings.Contains(lower, "ls ") || strings.HasPrefix(strings.TrimSpace(lower), "ls")
+	return bash.ExitCode == 2 && containsBuiltin(input)
 }
 
 func containsBuiltin(s string) bool {
@@ -496,6 +588,9 @@ func containsBuiltin(s string) bool {
 
 func differenceReason(a, b runOutput) string {
 	var p []string
+	if a.StartError != "" || b.StartError != "" {
+		p = append(p, "process start error")
+	}
 	if a.Stdout != b.Stdout {
 		p = append(p, "stdout")
 	}
@@ -516,13 +611,13 @@ func printResults(rs []result, o options) {
 			CoreutilsVersion string   `json:"coreutils_version"`
 			Results          []result `json:"results"`
 		}{"slop", o.bashVersion, o.coreutils, rs}
-		_ = json.NewEncoder(os.Stdout).Encode(payload)
+		fatalIf(json.NewEncoder(os.Stdout).Encode(payload))
 		return
 	}
 	if o.format == "jsonl" {
 		enc := json.NewEncoder(os.Stdout)
 		for _, r := range rs {
-			_ = enc.Encode(r)
+			fatalIf(enc.Encode(r))
 		}
 		return
 	}
@@ -565,7 +660,7 @@ func printFailure(r result) {
 }
 
 func verifyCommand(shell, input string) string {
-	return "printf %s " + shellQuote(input) + " | " + shell
+	return "tmp=$(mktemp -d); mkdir -p \"$tmp/outfiles\"; (cd \"$tmp\" && printf %s " + shellQuote(input) + " | env LC_ALL=C TERM=dumb " + shell + "); rc=$?; rm -rf \"$tmp\"; exit $rc"
 }
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'" }
 func indent(s string) string {
@@ -604,6 +699,17 @@ func joinReason(a, b string) string {
 		return b
 	}
 	return a + "; " + b
+}
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return "unknown error"
+}
+func testerErrorResult(t testCase, err error) result {
+	return result{ID: t.ID, Input: t.Input, Source: t.Source, Status: "fail", Reason: "tester setup error: " + err.Error()}
 }
 func commandVersion(name, arg string) string {
 	out, err := exec.Command(name, arg).CombinedOutput()
