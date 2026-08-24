@@ -11,10 +11,8 @@ This is personal tooling, not an evaluator. **Do not fail someone because slop s
 ## Install
 
 ```sh
-go install github.com/VeyasEvilBot/42_minishell_tester/cmd/slop@go-slop
+go install github.com/VeyasEvilBot/42_minishell_tester/cmd/slop@latest
 ```
-
-When merged/tagged, replace `@go-slop` with `@latest`.
 
 ## Run
 
